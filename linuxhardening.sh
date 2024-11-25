@@ -6,191 +6,141 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+LOGFILE="/var/log/server_hardening.log"
+echo "$(date): Starting server hardening process..." | tee -a $LOGFILE
+
 confirm() {
     read -p "$1 (yes/no): " choice
     case "$choice" in
         yes|y|Y) return 0 ;;
-        no|n|N) echo "Skipping this step."; return 1 ;;
+        no|n|N) echo "Skipping this step." | tee -a $LOGFILE; return 1 ;;
         *) echo "Invalid input. Please enter yes or no."; confirm "$1" ;;
     esac
 }
 
-echo "Starting the system hardening process..."
-
-# Update and upgrade the system
+# Update and Upgrade System
 if confirm "Do you want to update and upgrade the system?"; then
-    apt update && apt upgrade -y || yum update -y
+    echo "Updating and upgrading system packages..." | tee -a $LOGFILE
+    apt update && apt upgrade -y || yum update -y | tee -a $LOGFILE
 else
-    echo "Skipping system update."
+    echo "Skipping system update." | tee -a $LOGFILE
 fi
 
-# Configure iptables for kernel-level firewall
-if confirm "Do you want to configure iptables for kernel-level firewall?"; then
-    iptables -F
-    iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-    iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -A INPUT -j DROP
-    iptables-save > /etc/iptables/rules.v4
+# Install Required Packages
+echo "Installing essential packages..." | tee -a $LOGFILE
+apt install -y ufw fail2ban iptables-persistent auditd clamav unattended-upgrades || yum install -y firewalld fail2ban audit clamav epel-release -y | tee -a $LOGFILE
+
+# Configure UFW
+if confirm "Do you want to configure UFW?"; then
+    echo "Configuring UFW..." | tee -a $LOGFILE
+    ufw allow 22/tcp
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw enable | tee -a $LOGFILE
 else
-    echo "Skipping iptables configuration."
+    echo "Skipping UFW configuration." | tee -a $LOGFILE
 fi
 
-# Configure Firewalld
-if confirm "Do you want to configure Firewalld?"; then
-    apt install firewalld -y || yum install firewalld -y
+# Configure Firewalld (if UFW is unavailable)
+if ! command -v ufw &> /dev/null && confirm "Do you want to configure Firewalld?"; then
+    echo "Configuring Firewalld..." | tee -a $LOGFILE
     systemctl enable firewalld
     systemctl start firewalld
     firewall-cmd --set-default-zone=public
     firewall-cmd --permanent --add-service=ssh
     firewall-cmd --permanent --add-service=http
     firewall-cmd --permanent --add-service=https
-    firewall-cmd --reload
-else
-    echo "Skipping Firewalld configuration."
+    firewall-cmd --reload | tee -a $LOGFILE
 fi
 
-# SSH Hardening
-if confirm "Do you want to harden SSH configuration?"; then
+# Configure Fail2Ban
+if confirm "Do you want to configure Fail2Ban?"; then
+    echo "Configuring Fail2Ban..." | tee -a $LOGFILE
+    cat <<EOL > /etc/fail2ban/jail.local
+[DEFAULT]
+ignoreip = 127.0.0.1/8
+bantime  = 3600
+findtime  = 600
+maxretry = 5
+
+[sshd]
+enabled = true
+port    = 22
+filter  = sshd
+logpath = /var/log/auth.log
+EOL
+    systemctl enable fail2ban
+    systemctl restart fail2ban | tee -a $LOGFILE
+else
+    echo "Skipping Fail2Ban configuration." | tee -a $LOGFILE
+fi
+
+# Set Sysctl Parameters
+if confirm "Do you want to configure kernel parameters?"; then
+    echo "Configuring kernel parameters..." | tee -a $LOGFILE
+    cat <<EOL > /etc/sysctl.d/hardening.conf
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+EOL
+    sysctl --system | tee -a $LOGFILE
+else
+    echo "Skipping kernel parameter configuration." | tee -a $LOGFILE
+fi
+
+# Configure SSH
+if confirm "Do you want to harden SSH?"; then
+    echo "Hardening SSH configuration..." | tee -a $LOGFILE
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
     sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
     sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
     sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-    echo "HostKeyAlgorithms +ssh-ed25519" >> /etc/ssh/sshd_config
-    echo "KexAlgorithms +curve25519-sha256" >> /etc/ssh/sshd_config
-    systemctl restart sshd
+    systemctl restart sshd | tee -a $LOGFILE
 else
-    echo "Skipping SSH hardening."
+    echo "Skipping SSH hardening." | tee -a $LOGFILE
 fi
 
-# Install Lynis for auditing
-if confirm "Do you want to install Lynis for auditing?"; then
-    apt install lynis -y || yum install lynis -y
-    echo "Running Lynis security audit scans..."
-    lynis audit system > /root/lynis_system_audit.log
-    lynis audit security-controls > /root/lynis_security_controls_audit.log
-    lynis audit software > /root/lynis_software_audit.log
-else
-    echo "Skipping Lynis installation and scans."
-fi
-
-# Install and run rkhunter for rootkit detection
-if confirm "Do you want to install and run rkhunter for rootkit detection?"; then
-    apt install rkhunter -y || yum install rkhunter -y
-    rkhunter --update
-    rkhunter --check --skip-keypress
-    rkhunter --remove
-else
-    echo "Skipping rkhunter installation and checks."
-fi
-
-#!/bin/bash
-
-# Ensure the script is run as root
-if [[ $EUID -ne 0 ]]; then
-    echo "This script must be run as root."
-    exit 1
-fi
-
-confirm() {
-    read -p "$1 (yes/no): " choice
-    case "$choice" in
-        yes|y|Y) return 0 ;;
-        no|n|N) echo "Skipping this step."; return 1 ;;
-        *) echo "Invalid input. Please enter yes or no."; confirm "$1" ;;
-    esac
-}
-
-echo "Starting the enhanced system hardening process..."
-
-# Disable unnecessary services
-if confirm "Do you want to disable unnecessary services (CUPS, Avahi, Bluetooth)?"; then
-    echo "Disabling unnecessary services..."
-    systemctl disable cups 2>/dev/null
-    systemctl disable avahi-daemon 2>/dev/null
-    systemctl disable bluetooth 2>/dev/null
-    echo "Unnecessary services disabled."
-else
-    echo "Skipping disabling unnecessary services."
-fi
-
-# Install and configure antivirus (ClamAV)
-if confirm "Do you want to install and configure ClamAV antivirus?"; then
-    echo "Installing ClamAV..."
-    apt install clamav clamav-daemon -y || yum install clamav clamav-update -y
+# Run Antivirus Scan
+if confirm "Do you want to install and run ClamAV?"; then
+    echo "Installing and configuring ClamAV..." | tee -a $LOGFILE
     freshclam
-    systemctl enable clamav-daemon
-    systemctl start clamav-daemon
-    echo "ClamAV installed and configured."
+    clamscan -r --bell -i / | tee -a $LOGFILE
 else
-    echo "Skipping ClamAV installation."
+    echo "Skipping ClamAV installation." | tee -a $LOGFILE
 fi
 
-# Set strong file permissions
-if confirm "Do you want to set strong file permissions?"; then
-    echo "Setting file permissions..."
-    chmod 700 /root
-    chmod 700 /etc/ssh
-    chmod 600 /etc/ssh/sshd_config
-    chmod -R go-rwx /var/log
-    echo "File permissions set."
-else
-    echo "Skipping setting file permissions."
-fi
-
-# Install and configure auditd
-if confirm "Do you want to install and configure auditd for monitoring?"; then
-    echo "Installing and configuring auditd..."
-    apt install auditd -y || yum install audit -y
+# Install and Configure Auditd
+if confirm "Do you want to install and configure Auditd?"; then
+    echo "Configuring Auditd..." | tee -a $LOGFILE
     systemctl enable auditd
     systemctl start auditd
-    auditctl -e 1
-    echo "Auditd installed and monitoring enabled."
+    auditctl -e 1 | tee -a $LOGFILE
 else
-    echo "Skipping auditd installation."
+    echo "Skipping Auditd configuration." | tee -a $LOGFILE
 fi
 
-# Enable automatic updates
+# Enable Automatic Updates
 if confirm "Do you want to enable automatic updates?"; then
-    echo "Enabling automatic updates..."
-    apt install unattended-upgrades -y
-    dpkg-reconfigure -plow unattended-upgrades
-    echo "Automatic updates enabled."
+    echo "Enabling automatic updates..." | tee -a $LOGFILE
+    dpkg-reconfigure -plow unattended-upgrades | tee -a $LOGFILE
 else
-    echo "Skipping automatic updates configuration."
+    echo "Skipping automatic updates." | tee -a $LOGFILE
 fi
 
-# Check for world-writable files
-if confirm "Do you want to check and fix world-writable files?"; then
-    echo "Checking for world-writable files..."
-    find / -xdev -type f -perm -0002 -exec chmod o-w {} \;
-    echo "World-writable files fixed."
-else
-    echo "Skipping check for world-writable files."
+# Final Message
+echo "$(date): Server hardening process complete. Review $LOGFILE for details." | tee -a $LOGFILE
+read -p "Reboot the system now? (yes/no): " REBOOT
+if [[ $REBOOT =~ ^[Yy](es)?$ ]]; then
+    reboot
 fi
-
-# Remove unnecessary packages
-if confirm "Do you want to remove unnecessary packages?"; then
-    echo "Removing unnecessary packages..."
-    apt autoremove -y || yum autoremove -y
-    echo "Unnecessary packages removed."
-else
-    echo "Skipping removal of unnecessary packages."
-fi
-
-# Configure password policy
-if confirm "Do you want to configure password policy?"; then
-    echo "Configuring password policy..."
-    cat <<EOF >> /etc/security/pwquality.conf
-minlen = 12
-minclass = 4
-EOF
-    echo "Password policy configured."
-else
-    echo "Skipping password policy configuration."
-fi
-
-# Final message
-echo "System hardening complete. Review the audit reports and validation checks."
-echo "Reboot the system to ensure all changes take effect."
